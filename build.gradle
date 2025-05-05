@@ -1,0 +1,45 @@
+plugins {
+    id 'java'
+    id 'java-gradle-plugin'
+    id 'groovy'
+
+    id 'maven-publish'
+}
+
+group = 'org.example'
+version = '1.0-SNAPSHOT'
+
+repositories {
+    mavenCentral()
+}
+
+tasks.withType(Copy).configureEach {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+dependencies {
+    implementation 'org.ow2.asm:asm:9.6'
+    implementation 'com.github.javaparser:javaparser-symbol-solver-core:3.25.4'
+
+    testImplementation platform('org.junit:junit-bom:5.9.1')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+}
+
+test {
+    useJUnitPlatform()
+}
+
+gradlePlugin {
+    plugins {
+        DeadCodePlugin {
+            id = "org.example.dead-code-plugin"
+            implementationClass = "org.example.DeadCodePlugin"
+        }
+    }
+}
+
+publishing {
+    repositories {
+        mavenLocal()
+    }
+}
