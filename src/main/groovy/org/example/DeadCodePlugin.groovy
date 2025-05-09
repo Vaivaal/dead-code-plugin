@@ -13,6 +13,7 @@ import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSol
 import com.github.javaparser.symbolsolver.resolution.typesolvers.JarTypeSolver
 import com.github.javaparser.symbolsolver.resolution.typesolvers.JavaParserTypeSolver
 import com.github.javaparser.symbolsolver.resolution.typesolvers.ReflectionTypeSolver
+import com.github.javaparser.ast.body.EnumDeclaration
 import org.gradle.api.Plugin
 import org.gradle.api.Project
 import groovy.json.JsonOutput
@@ -66,11 +67,18 @@ class DeadCodePlugin implements Plugin<Project> {
                                         def resolved = m.resolve()
                                         methodFqn = toMethodKey(resolved.declaringType.qualifiedName, resolved.name)
                                     } catch (Exception e) {
-                                        def className = m.findAncestor(ClassOrInterfaceDeclaration)
-                                                .map {
-                                                    def pkg = cu.packageDeclaration.map { it.nameAsString }.orElse("")
-                                                    return pkg ? "${pkg}.${it.nameAsString}" : it.nameAsString
-                                                }.orElse("<unknown>")
+                                        def classOrEnumNode = m.findAncestor(ClassOrInterfaceDeclaration).orElse(null)
+                                        if (!classOrEnumNode) {
+                                            classOrEnumNode = m.findAncestor(EnumDeclaration).orElse(null)
+                                        }
+
+                                        def className
+                                        if (classOrEnumNode != null) {
+                                            def pkg = cu.packageDeclaration.map { it.nameAsString }.orElse("")
+                                            className = pkg ? "${pkg}.${classOrEnumNode.nameAsString}" : classOrEnumNode.nameAsString
+                                        } else {
+                                            className = "<unknown>"
+                                        }
                                         methodFqn = toMethodKey(className, m.nameAsString)
                                     }
 
@@ -254,7 +262,7 @@ class DeadCodePlugin implements Plugin<Project> {
                             }
                         } catch (Exception e) {
                             if (call.toString().contains(libPrefix)) {
-                                //unresolvedCalls << "Could not resolve: ${call} in ${file.name} – ${e.message}"
+                                println "Could not resolve: ${call} in ${file.name} – ${e.message}"
                             }
                         }
                     }
@@ -271,7 +279,7 @@ class DeadCodePlugin implements Plugin<Project> {
                                 usedLibraryMethods << "${type}.${resolved.name}"
                             }
                         } catch (Exception e) {
-                            //unresolvedCalls << "Could not resolve method reference: ${ref} in ${file.name} – ${e.message}"
+                            println "Could not resolve method reference: ${ref} in ${file.name} – ${e.message}"
                         }
                     }
                 }
