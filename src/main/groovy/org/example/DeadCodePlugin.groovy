@@ -17,6 +17,8 @@ import com.github.javaparser.ast.body.EnumDeclaration
 import org.gradle.api.Plugin
 import org.gradle.api.Project
 import groovy.json.JsonOutput
+import com.github.javaparser.ast.expr.ObjectCreationExpr
+import com.github.javaparser.ast.body.ConstructorDeclaration
 
 
 class DeadCodePlugin implements Plugin<Project> {
@@ -47,9 +49,11 @@ class DeadCodePlugin implements Plugin<Project> {
                 Map<String, Set<String>> callGraph = [:].withDefault { [] as Set }
                 Set<String> allMethods = [] as Set
                 Set<String> entryPoints = [] as Set
+                Set<String> instantiatedTypes = [] as Set
 
-                def toMethodKey = { typeName, methodName ->
-                    return "${typeName}.${methodName}".replace("\$", ".")
+                def toMethodKey = { typeName, methodName, paramTypes ->
+                    def params = paramTypes.join(',')
+                    return "${typeName}.${methodName}(${params})".replace('\$', '.')
                 }
 
                 Set<String> controllerMethods = [] as Set
@@ -61,11 +65,47 @@ class DeadCodePlugin implements Plugin<Project> {
                             if (cuOpt.isPresent()) {
                                 CompilationUnit cu = cuOpt.get()
 
+                                cu.findAll(ObjectCreationExpr).each { objCreation ->
+                                    try {
+                                        def type = objCreation.calculateResolvedType()
+                                        if (type.isReferenceType()) {
+                                            instantiatedTypes << type.asReferenceType().qualifiedName
+                                        }
+                                    } catch (Exception ignored) {}
+                                }
+
+                                cu.findAll(ConstructorDeclaration).each { ctor ->
+                                    try {
+                                        ctor.walk(MethodCallExpr) { call ->
+                                            try {
+                                                def resolvedCall = call.resolve()
+                                                def declaringType = resolvedCall.declaringType().qualifiedName
+                                                def paramTypesCall = (0..<resolvedCall.numberOfParams).collect { i ->
+                                                    resolvedCall.getParam(i).type.describe().replaceAll('\\s', '')
+                                                }
+
+                                                def projectGroup = project.group.toString()
+                                                if (!declaringType.startsWith(projectGroup)) {
+                                                    return
+                                                }
+
+                                                def calledMethod = toMethodKey(declaringType, resolvedCall.name, paramTypesCall)
+                                                callGraph["<ctor>"] << calledMethod
+
+                                            } catch (Exception ignored) {}
+                                        }
+                                    } catch (Exception ignored) {}
+                                }
+
                                 cu.findAll(MethodDeclaration).each { m ->
                                     String methodFqn
+                                    List<String> paramTypes = []
                                     try {
                                         def resolved = m.resolve()
-                                        methodFqn = toMethodKey(resolved.declaringType.qualifiedName, resolved.name)
+                                        paramTypes = (0..<resolved.numberOfParams).collect { i ->
+                                            resolved.getParam(i).type.describe().replaceAll('\\s', '')
+                                        }
+                                        methodFqn = toMethodKey(resolved.declaringType().qualifiedName, resolved.name, paramTypes)
                                     } catch (Exception e) {
                                         def classOrEnumNode = m.findAncestor(ClassOrInterfaceDeclaration).orElse(null)
                                         if (!classOrEnumNode) {
@@ -79,7 +119,8 @@ class DeadCodePlugin implements Plugin<Project> {
                                         } else {
                                             className = "<unknown>"
                                         }
-                                        methodFqn = toMethodKey(className, m.nameAsString)
+                                        paramTypes = m.parameters.collect { it.typeAsString }
+                                        methodFqn = toMethodKey(className, m.nameAsString, paramTypes)
                                     }
 
                                     def classNodeOpt = m.findAncestor(ClassOrInterfaceDeclaration)
@@ -93,21 +134,12 @@ class DeadCodePlugin implements Plugin<Project> {
 
                                     allMethods << methodFqn
 
-                                    if (m.nameAsString == "main" && m.isStatic()) {
-                                        entryPoints << methodFqn
-                                    }
-
                                     m.walk(MethodCallExpr) { call ->
                                         try {
                                             def resolved = call.resolve()
-                                            def declaringType
-
-                                            if (resolved.metaClass.hasProperty(resolved, 'declaringType')) {
-                                                declaringType = resolved.declaringType.qualifiedName
-                                            } else if (resolved.declaringType() != null) {
-                                                declaringType = resolved.declaringType().qualifiedName
-                                            } else {
-                                                declaringType = "<unknown>"
+                                            def declaringType = resolved.declaringType().qualifiedName
+                                            def paramTypesCall = (0..<resolved.numberOfParams).collect { i ->
+                                                resolved.getParam(i).type.describe().replaceAll('\\s', '')
                                             }
 
                                             def projectGroup = project.group.toString()
@@ -115,7 +147,7 @@ class DeadCodePlugin implements Plugin<Project> {
                                                 return
                                             }
 
-                                            def calledMethod = "${declaringType}.${resolved.name}"
+                                            def calledMethod = toMethodKey(declaringType, resolved.name, paramTypesCall)
                                             callGraph[methodFqn] << calledMethod
 
                                         } catch (Exception e) {
@@ -130,9 +162,8 @@ class DeadCodePlugin implements Plugin<Project> {
                                                         return
                                                     }
 
-                                                    def fallbackCalled = "${declaringType}.${call.nameAsString}"
+                                                    def fallbackCalled = toMethodKey(declaringType, call.nameAsString, [])
                                                     callGraph[methodFqn] << fallbackCalled
-                                                    //println "Fallback (scope-resolved): $fallbackCalled from $methodFqn"
                                                     return
                                                 }
                                             } catch (Exception ignored) {}
@@ -142,9 +173,8 @@ class DeadCodePlugin implements Plugin<Project> {
                                                         def pkg = cu.packageDeclaration.map { it.nameAsString }.orElse("")
                                                         return pkg ? "${pkg}.${classDecl.nameAsString}" : classDecl.nameAsString
                                                     }.orElse("<unknown>")
-                                            def fallbackCalled = "${fallbackClass}.${call.nameAsString}"
+                                            def fallbackCalled = toMethodKey(fallbackClass, call.nameAsString, [])
                                             callGraph[methodFqn] << fallbackCalled
-                                            //println "Fallback (guessed class): $fallbackCalled from $methodFqn"
                                         }
                                     }
                                 }
@@ -153,16 +183,8 @@ class DeadCodePlugin implements Plugin<Project> {
                     }
                 }
 
-                entryPoints.addAll(callGraph.keySet())
-
-//                callGraph.each { caller, callees ->
-//                    println "${caller} calls:"
-//                    callees.each { callee ->
-//                        println "    -> $callee"
-//                    }
-//                }
-
-                callGraph.keySet().each { entryPoints << it }
+                allMethods.findAll { it.contains(".main(") }.each { entryPoints << it }
+                entryPoints << "<ctor>"
 
                 Set<String> reachable = [] as Set
                 def queue = new LinkedList<String>(entryPoints)
@@ -178,6 +200,7 @@ class DeadCodePlugin implements Plugin<Project> {
                         }
                     }
                 }
+
                 reachable.removeAll(controllerMethods)
 
                 def unusedMethods = (allMethods - reachable).toSorted()
@@ -251,16 +274,26 @@ class DeadCodePlugin implements Plugin<Project> {
                             def declaringType = "<unknown>"
                             try {
                                 if (resolved.metaClass.hasProperty(resolved, "declaringType")) {
-                                    declaringType = resolved.declaringType.qualifiedName
+                                    declaringType = resolved.declaringType().qualifiedName
                                 } else if (resolved.declaringType() != null) {
                                     declaringType = resolved.declaringType().qualifiedName
                                 }
                             } catch (Exception ignored) {}
 
                             if (declaringType.startsWith(libPrefix)) {
-                                usedLibraryMethods << "${declaringType}.${resolved.name}"
+                                def paramTypes = (0..<resolved.numberOfParams)
+                                        .collect { i ->
+                                            try {
+                                                return resolved.getParam(i).type.describe()
+                                            } catch (Exception e) {
+                                                return "<?>"
+                                            }
+                                        }
+                                        .join(", ")
+                                usedLibraryMethods << "${declaringType}.${resolved.name}(${paramTypes})"
                             }
                         } catch (Exception e) {
+                            println "Exception $e"
                             if (call.toString().contains(libPrefix)) {
                                 println "Could not resolve: ${call} in ${file.name} – ${e.message}"
                             }
@@ -272,7 +305,7 @@ class DeadCodePlugin implements Plugin<Project> {
                             def resolved = ref.resolve()
                             def type = "<unknown>"
                             try {
-                                type = resolved.declaringType?.qualifiedName ?: "<unknown>"
+                                type = resolved.declaringType()?.qualifiedName ?: "<unknown>"
                             } catch (Exception ignored) {}
 
                             if (type.startsWith(libPrefix)) {
