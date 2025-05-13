@@ -14,6 +14,8 @@ import com.github.javaparser.symbolsolver.resolution.typesolvers.JarTypeSolver
 import com.github.javaparser.symbolsolver.resolution.typesolvers.JavaParserTypeSolver
 import com.github.javaparser.symbolsolver.resolution.typesolvers.ReflectionTypeSolver
 import com.github.javaparser.ast.body.EnumDeclaration
+import groovy.json.JsonSlurper
+import org.gradle.api.GradleException
 import org.gradle.api.Plugin
 import org.gradle.api.Project
 import groovy.json.JsonOutput
@@ -324,6 +326,50 @@ class DeadCodePlugin implements Plugin<Project> {
                 ]))
 
                 println "\nOutput written to ${outputFile.absolutePath}"
+            }
+        }
+
+        project.task('findTrulyUnusedMethods') {
+            group = 'analysis'
+
+            doLast {
+                def unusedFilePath = project.hasProperty('unusedMethodsFile') ? project.property('unusedMethodsFile') : null
+                def usedDirPath = project.hasProperty('usedMethodsDir') ? project.property('usedMethodsDir') : null
+
+                if (!unusedFilePath || !usedDirPath) {
+                    throw new GradleException("Usage: -P unusedMethodsFile=<path> -P usedMethodsDir=<path>")
+                }
+
+                def unusedFile = project.file(unusedFilePath)
+                def usedDir = project.file(usedDirPath)
+
+                if (!unusedFile.exists()) {
+                    throw new GradleException("Unused methods file not found: $unusedFilePath")
+                }
+                if (!usedDir.exists() || !usedDir.directory) {
+                    throw new GradleException("Used methods directory not found or not a directory: $usedDirPath")
+                }
+
+                def jsonSlurper = new JsonSlurper()
+                def unusedJson = jsonSlurper.parse(unusedFile)
+                def unusedMethods = unusedJson.unusedMethods as Set
+
+                def usedMethods = [] as Set
+                usedDir.eachFileMatch(~/.*\.json/) { file ->
+                    def parsed = jsonSlurper.parse(file)
+                    def methods = parsed.usedMethods
+                    if (methods instanceof List) {
+                        usedMethods.addAll(methods)
+                    }
+                }
+
+                def trulyUnused = unusedMethods.findAll { !usedMethods.contains(it) }
+
+                def outputFile = new File(project.buildDir, "truly-unused-methods.json")
+                def outputObject = [trulyUnusedMethods: trulyUnused.sort()]
+                outputFile.text = JsonOutput.prettyPrint(JsonOutput.toJson(outputObject))
+
+                println "Saved to: ${outputFile.absolutePath}"
             }
         }
     }
