@@ -17,7 +17,14 @@ tasks.withType(Copy).configureEach {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
+configurations {
+    lombok
+}
+
 dependencies {
+    compileOnly 'org.projectlombok:lombok:1.18.30'
+    annotationProcessor 'org.projectlombok:lombok:1.18.30'
+
     implementation 'org.ow2.asm:asm:9.6'
     implementation 'com.github.javaparser:javaparser-symbol-solver-core:3.25.4'
 
