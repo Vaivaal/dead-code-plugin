@@ -78,9 +78,11 @@ class DeadCodePlugin implements Plugin<Project> {
 //                        .setSymbolResolver(new JavaSymbolSolver(typeSolver))
 //                )
                 def javaVersion = JavaVersion.current()
+                def javaMajor = javaVersion.majorVersion as int
+                def languageLevel = javaMajor > 21 ? "JAVA_21" : "JAVA_${javaMajor}"
 
                 ParserConfiguration config = new ParserConfiguration()
-                        .setLanguageLevel(ParserConfiguration.LanguageLevel.valueOf("JAVA_${javaVersion.majorVersion}"))
+                        .setLanguageLevel(ParserConfiguration.LanguageLevel.valueOf(languageLevel))
                         .setSymbolResolver(new JavaSymbolSolver(typeSolver));
                 JavaParser parser = new JavaParser(config);
 
@@ -475,10 +477,13 @@ class DeadCodePlugin implements Plugin<Project> {
                 }
 
                 def javaVersion = JavaVersion.current()
-                def config = new ParserConfiguration()
-                        .setLanguageLevel(ParserConfiguration.LanguageLevel.valueOf("JAVA_${javaVersion.majorVersion}"))
-                        .setSymbolResolver(new JavaSymbolSolver(typeSolver))
-                def parser = new JavaParser(config)
+                def javaMajor = javaVersion.majorVersion as int
+                def languageLevel = javaMajor > 21 ? "JAVA_21" : "JAVA_${javaMajor}"
+
+                ParserConfiguration config = new ParserConfiguration()
+                        .setLanguageLevel(ParserConfiguration.LanguageLevel.valueOf(languageLevel))
+                        .setSymbolResolver(new JavaSymbolSolver(typeSolver));
+                JavaParser parser = new JavaParser(config);
 
                 Set<String> usedLibraryMethods = [] as Set
                 //Set<String> unresolvedCalls = [] as Set
