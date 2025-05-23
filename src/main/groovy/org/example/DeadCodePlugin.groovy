@@ -12,6 +12,7 @@ import com.github.javaparser.ast.expr.MethodReferenceExpr
 import com.github.javaparser.resolution.declarations.ResolvedMethodDeclaration
 import com.github.javaparser.symbolsolver.JavaSymbolSolver
 import com.github.javaparser.symbolsolver.javaparsermodel.contexts.ObjectCreationContext
+import com.github.javaparser.symbolsolver.javaparsermodel.declarations.JavaParserClassDeclaration
 import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver
 import com.github.javaparser.symbolsolver.resolution.typesolvers.JarTypeSolver
 import com.github.javaparser.symbolsolver.resolution.typesolvers.JavaParserTypeSolver
@@ -25,6 +26,8 @@ import groovy.json.JsonOutput
 import com.github.javaparser.ast.expr.ObjectCreationExpr
 import com.github.javaparser.ast.body.ConstructorDeclaration
 import org.gradle.api.JavaVersion
+import static com.github.javaparser.ParseStart.COMPILATION_UNIT
+import com.github.javaparser.Providers
 
 
 class DeadCodePlugin implements Plugin<Project> {
@@ -33,10 +36,32 @@ class DeadCodePlugin implements Plugin<Project> {
 
         project.task('findPossiblyUnusedMethods') {
             group = 'analysis'
+            dependsOn project.tasks.named("build")
 
             doLast{
-                project.configurations.maybeCreate('lombok')
-                project.dependencies.add('lombok', 'org.projectlombok:lombok:1.18.30')
+                def typeSolver = new CombinedTypeSolver()
+
+                def javaVersion = JavaVersion.current()
+                def javaMajor = javaVersion.majorVersion as int
+                def languageLevel = javaMajor > 21 ? "JAVA_21" : "JAVA_${javaMajor}"
+
+                if (javaMajor < 23){
+                    project.configurations.maybeCreate('lombok')
+                    project.dependencies.add('lombok', 'org.projectlombok:lombok:1.18.30')
+
+                    def delombokDir = new File("${project.buildDir}/delombok")
+                    if (delombokDir.exists()) {
+                        delombokDir.deleteDir()
+                    }
+                    delombokDir.mkdirs()
+
+                    project.javaexec {
+                        mainClass = 'lombok.launch.Main'
+                        classpath = project.configurations.lombok + project.sourceSets.main.compileClasspath
+                        args = ['delombok', 'src/main/java', '-d', delombokDir.absolutePath]
+                    }
+                    typeSolver.add(new JavaParserTypeSolver(delombokDir))
+                }
 
                 def javaSourceDirs = project.sourceSets.main.allJava.srcDirs.findAll { it.exists() }
 
@@ -45,18 +70,7 @@ class DeadCodePlugin implements Plugin<Project> {
                     return
                 }
 
-                def delombokDir = new File("${project.buildDir}/delombok")
-                delombokDir.mkdirs()
-
-                project.javaexec {
-                    mainClass = 'lombok.launch.Main'
-                    classpath = project.configurations.lombok + project.sourceSets.main.compileClasspath
-                    args = ['delombok', 'src/main/java', '-d', delombokDir.absolutePath]
-                }
-
-                def typeSolver = new CombinedTypeSolver()
                 typeSolver.add(new ReflectionTypeSolver())
-                typeSolver.add(new JavaParserTypeSolver(delombokDir))
                 javaSourceDirs.each { dir ->
                     typeSolver.add(new JavaParserTypeSolver(dir))
                 }
@@ -77,9 +91,6 @@ class DeadCodePlugin implements Plugin<Project> {
 //                def parser = new JavaParser(new ParserConfiguration()
 //                        .setSymbolResolver(new JavaSymbolSolver(typeSolver))
 //                )
-                def javaVersion = JavaVersion.current()
-                def javaMajor = javaVersion.majorVersion as int
-                def languageLevel = javaMajor > 21 ? "JAVA_21" : "JAVA_${javaMajor}"
 
                 ParserConfiguration config = new ParserConfiguration()
                         .setLanguageLevel(ParserConfiguration.LanguageLevel.valueOf(languageLevel))
@@ -93,259 +104,263 @@ class DeadCodePlugin implements Plugin<Project> {
                 Map<String, String> fieldTypes = [:]
 
                 javaSourceDirs.each{ sourceDir ->
-                    //println sourceDir
                     sourceDir.eachFileRecurse {file ->
-                        if (file.name.endsWith('.java')){
+                        if (file.name.endsWith(".java")) {
 
-                            //println "Found java file: ${file.absolutePath}"
-
-                            def cuOpt = parser.parse(file).getResult()
+                            //def cuOpt = parser.parse(file).getResult()
+                            def cuOpt = parser.parse(COMPILATION_UNIT, Providers.provider(file)).getResult()
                             if (cuOpt.isPresent()) {
-                                //println "present"
-                                CompilationUnit cu = cuOpt.get()
+                                try {
+                                    CompilationUnit cu = cuOpt.get()
 
-                                cu.findAll(FieldDeclaration).each {field ->
-                                    field.variables.each {var ->
-                                        try{
-                                            def fieldType = field.commonType.resolve().describe()
-                                            fieldTypes[var.nameAsString] = fieldType
+                                    cu.findAll(FieldDeclaration).each { field ->
+                                        field.variables.each { var ->
+                                            try {
+                                                def fieldType = field.commonType.resolve().describe()
+                                                fieldTypes[var.nameAsString] = fieldType
 
-                                        }catch(Exception e){
-                                            println e
+                                            } catch (Exception e) {
+                                            }
+
+                                            if (var.initializer.isPresent()) {
+                                                def initExpr = var.initializer.get()
+
+                                                initExpr.walk(MethodCallExpr) { call ->
+                                                    try {
+                                                        def resolved = call.resolve()
+                                                        def declaringType = resolved.declaringType().qualifiedName
+                                                        def paramTypesCall = (0..<resolved.numberOfParams).collect { param ->
+                                                            try {
+                                                                resolved.getParam(param).type.describe()
+                                                            } catch (Exception e) {
+                                                                "<?>"
+                                                            }
+                                                        }
+                                                        def calledMethod = toMethodKey(declaringType, resolved.name, paramTypesCall)
+                                                        callGraph["<fieldInit>"] << calledMethod
+
+                                                    } catch (Exception ex) {
+                                                        //TO DO: dependency injection
+                                                    }
+                                                }
+                                            }
                                         }
+                                    }
 
-                                        if (var.initializer.isPresent()){
-                                            def initExpr = var.initializer.get()
+                                    cu.findAll(ObjectCreationExpr).each { objectCreation ->
+                                        try {
+                                            def type = objectCreation.calculateResolvedType();
+                                            if (type.isReferenceType()) {
+                                                instantiatedTypes << type.asReferenceType().qualifiedName
+                                            }
+                                        } catch (Exception e) {
+                                        }
+                                    }
 
-                                            initExpr.walk (MethodCallExpr) {call ->
-                                                try{
-                                                    def resolved = call.resolve()
-                                                    def declaringType = resolved.declaringType().qualifiedName
-                                                    def paramTypesCall = (0..<resolved.numberOfParams).collect { param ->
+                                    cu.findAll(ConstructorDeclaration).each { ctor ->
+                                        try {
+                                            ctor.walk(MethodCallExpr) { call ->
+                                                try {
+                                                    def resolvedCall = call.resolve()
+                                                    def declaringType = resolvedCall.declaringType().qualifiedName
+                                                    def paramTypesCall = (0..<resolvedCall.numberOfParams).collect { param ->
                                                         try {
-                                                            resolved.getParam(param).type.describe()
+                                                            resolvedCall.getParam(param).type.describe()
                                                         } catch (Exception e) {
                                                             "<?>"
                                                         }
                                                     }
-                                                    def calledMethod = toMethodKey(declaringType, resolved.name, paramTypesCall)
-                                                    callGraph["<fieldInit>"] << calledMethod
-
-                                                }catch (Exception ex){
-                                                    println ex
-                                                    //TO DO: dependency injection
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                cu.findAll(ObjectCreationExpr).each {objectCreation ->
-                                    try {
-                                        def type = objectCreation.calculateResolvedType();
-                                        //println type
-                                        if (type.isReferenceType()){
-                                            instantiatedTypes << type.asReferenceType().qualifiedName
-                                        }
-                                    }catch (Exception e){
-                                        //println e
-                                    }
-                                }
-
-                                cu.findAll(ConstructorDeclaration).each { ctor ->
-                                    try {
-                                        ctor.walk(MethodCallExpr){call ->
-                                            try{
-                                                def resolvedCall = call.resolve()
-                                                def declaringType = resolvedCall.declaringType().qualifiedName
-                                                def paramTypesCall = (0..<resolvedCall.numberOfParams).collect { param ->
-                                                    try {
-                                                        resolvedCall.getParam(param).type.describe()
-                                                    } catch (Exception e) {
-                                                        "<?>"
+                                                    def projectGroup = project.group.toString()
+                                                    if (!declaringType.startsWith(projectGroup)) {
+                                                        return
                                                     }
-                                                }
-                                                def projectGroup = project.group.toString()
-                                                if(!declaringType.startsWith(projectGroup)){
-                                                    //println "${declaringType} Does not start with ${projectGroup}"
-                                                    return
-                                                }
 
-                                                def calledMethod = toMethodKey(declaringType, resolvedCall.name, paramTypesCall)
-                                                callGraph["<constructor>"] << calledMethod
+                                                    def calledMethod = toMethodKey(declaringType, resolvedCall.name, paramTypesCall)
+                                                    callGraph["<constructor>"] << calledMethod
 
-                                            }catch(Exception e){
-                                                //println e
+                                                } catch (Exception e) {
+                                                }
                                             }
+                                        } catch (Exception e) {
                                         }
-                                    }catch(Exception e){
-                                        //println e
                                     }
-                                }
 
-                                cu.findAll(MethodDeclaration).each{ m ->
-                                    List<String> paramTypes = []
-                                    String methodFqn
-                                    try{
-                                        def resolved = m.resolve()
+                                    cu.findAll(MethodDeclaration).each { m ->
+                                        List<String> paramTypes = []
+                                        String methodFqn
+                                        try {
+                                            def resolved = m.resolve()
 //                                        if (!resolved.declaringType().qualifiedName.startsWith(project.group.toString())){
 //                                            return
 //                                        }
-                                        paramTypes = (0..<resolved.numberOfParams).collect { param ->
-                                            try {
-                                                resolved.getParam(param).type.describe()
-                                            } catch (Exception e) {
-                                                "<?>"
-                                            }
-                                        }
-                                        methodFqn = toMethodKey(resolved.declaringType().qualifiedName, resolved.name, paramTypes)
-                                        //println "found method declaration: ${methodFqn}"
-                                    }catch(Exception e){
-                                        //println e
-                                        try{
-                                            def parentType = m.findAncestor(ClassOrInterfaceDeclaration).orElse(null)
-                                            def className = parentType?.nameAsString ?: "<unknown>"
-                                            def packageDecl = cu.packageDeclaration.isPresent() ? cu.packageDeclaration.get().nameAsString : ""
-                                            def fullType = packageDecl ? "$packageDecl.$className" : className
-
-                                            paramTypes = m.parameters.collect { param ->
-                                                try{
-                                                    param.type.resolve().describe()
-                                                }catch (Exception ex){
-                                                    println ex
-                                                    "<?>"
-                                                }
-                                            }
-
-                                            methodFqn = toMethodKey(fullType, m.nameAsString, paramTypes)
-                                            //println "found method declaration: ${methodFqn}"
-                                        }catch(Exception exe){
-                                            println exe
-                                        }
-                                    }
-                                    //println methodFqn
-                                    if (methodFqn == null){
-                                        //println m
-                                    }
-
-                                    def annotationsToIgnore = ['PostConstruct', 'PreDestroy', 'Scheduled', 'EventListener', 'Bean']
-
-                                    boolean isAnnotated = m.annotations.any{ ann ->
-                                        def annName = ann.name.asString()
-                                        annotationsToIgnore.contains(annName)
-                                    }
-
-                                    if (isAnnotated){
-                                        entryPoints << methodFqn
-                                    }
-
-                                    allMethods << methodFqn
-
-                                    m.walk(MethodCallExpr) {call ->
-                                        try {
-                                            def resolved = call.resolve()
-                                            def declaringType = resolved.declaringType().qualifiedName
-                                            def paramTypesCall = (0..<resolved.numberOfParams).collect { param ->
+                                            paramTypes = (0..<resolved.numberOfParams).collect { param ->
                                                 try {
                                                     resolved.getParam(param).type.describe()
                                                 } catch (Exception e) {
                                                     "<?>"
                                                 }
                                             }
+                                            methodFqn = toMethodKey(resolved.declaringType().qualifiedName, resolved.name, paramTypes)
+                                        } catch (Exception e) {
 
-                                            def calledMethod = toMethodKey(declaringType, resolved.name, paramTypesCall)
-//                                            println "Caller ${methodFqn}"
-//                                            println "Calleeeeeee ${calledMethod}"
-                                            callGraph[methodFqn] << calledMethod
+                                            try {
+                                                def parentType = m.findAncestor(ClassOrInterfaceDeclaration).orElse(null)
+                                                def className = parentType?.nameAsString ?: "<unknown>"
+                                                def packageDecl = cu.packageDeclaration.isPresent() ? cu.packageDeclaration.get().nameAsString : ""
+                                                def fullType = packageDecl ? "$packageDecl.$className" : className
 
-                                        }catch(Exception e){
-                                            //println e
-                                            if (call.scope.isPresent()){
-                                                def scope = call.scope.get()
-                                                if (scope.isNameExpr()){
-                                                    def callerVar = scope.asNameExpr().getNameAsString()
-                                                    def fieldType = fieldTypes[callerVar]
-                                                    if (fieldType){
+                                                paramTypes = m.parameters.collect { param ->
+                                                    try {
+                                                        param.type.resolve().describe()
+                                                    } catch (Exception ex) {
+                                                        "<?>"
+                                                    }
+                                                }
 
-                                                        def paramTypesDI = call.arguments.collect {arg ->
-                                                            try{
-                                                                arg.calculateResolvedType().describe()
-                                                            }catch (Exception ex){
-                                                                "<?>"
+                                                methodFqn = toMethodKey(fullType, m.nameAsString, paramTypes)
+                                            } catch (Exception exe) {
+                                            }
+                                        }
+                                        if (methodFqn == null) {
+                                        }
+
+                                        def annotationsToIgnore = ['PostConstruct', 'PreDestroy', 'Scheduled', 'EventListener', 'Bean']
+
+                                        boolean isAnnotated = m.annotations.any { ann ->
+                                            def annName = ann.name.asString()
+                                            annotationsToIgnore.contains(annName)
+                                        }
+
+                                        if (isAnnotated) {
+                                            entryPoints << methodFqn
+                                        }
+
+                                        allMethods << methodFqn
+
+                                        m.walk(MethodCallExpr) { call ->
+                                            try {
+                                                def resolved = call.resolve()
+                                                def declaringType = resolved.declaringType().qualifiedName
+                                                def paramTypesCall = (0..<resolved.numberOfParams).collect { param ->
+                                                    try {
+                                                        resolved.getParam(param).type.describe()
+                                                    } catch (Exception e) {
+                                                        "<?>"
+                                                    }
+                                                }
+
+                                                def calledMethod = toMethodKey(declaringType, resolved.name, paramTypesCall)
+                                                callGraph[methodFqn] << calledMethod
+
+                                                if (isInterface(declaringType, typeSolver)) {
+                                                    instantiatedTypes.each { typeName ->
+                                                        try {
+                                                            def ref = typeSolver.tryToSolveType(typeName)
+                                                            if (!ref.isSolved()) return
+
+                                                            def typeDecl = ref.getCorrespondingDeclaration()
+                                                            if (!typeDecl.isClass()) return
+
+                                                            def matchingImpl = typeDecl.getDeclaredMethods().find { impl ->
+                                                                try {
+                                                                    def implParamTypes = (0..<impl.numberOfParams).collect { i ->
+                                                                        try {
+                                                                            impl.getParam(i).type.describe()
+                                                                        } catch (Exception e) {
+                                                                            "<?>"
+                                                                        }
+                                                                    }
+
+                                                                    return impl.name == resolved.name &&
+                                                                            impl.numberOfParams == resolved.numberOfParams &&
+                                                                            implParamTypes == paramTypesCall
+                                                                } catch (Exception ignored) {
+                                                                    return false
+                                                                }
                                                             }
+
+                                                            if (matchingImpl != null) {
+                                                                def implKey = toMethodKey(typeName, matchingImpl.name, paramTypesCall)
+                                                                callGraph[methodFqn] << implKey
+                                                            }
+                                                        } catch (Exception e) {
                                                         }
+                                                    }
+                                                }
 
-                                                        def calledMethod = toMethodKey(fieldType, call.nameAsString, paramTypesDI)
-//                                                        println "Caller ${methodFqn}"
-//                                                        println "Calleeeeeee ${calledMethod}"
+                                            } catch (Exception e) {
+                                                if (call.scope.isPresent()) {
+                                                    def scope = call.scope.get()
+                                                    if (scope.isNameExpr()) {
+                                                        def callerVar = scope.asNameExpr().getNameAsString()
+                                                        def fieldType = fieldTypes[callerVar]
+                                                        if (fieldType) {
 
-                                                        callGraph[methodFqn] << calledMethod
+                                                            def paramTypesDI = call.arguments.collect { arg ->
+                                                                try {
+                                                                    arg.calculateResolvedType().describe()
+                                                                } catch (Exception ex) {
+                                                                    "<?>"
+                                                                }
+                                                            }
+                                                            def calledMethod = toMethodKey(fieldType, call.nameAsString, paramTypesDI)
+
+                                                            callGraph[methodFqn] << calledMethod
+                                                        }
                                                     }
                                                 }
                                             }
+
                                         }
 
-                                    }
-
-                                    m.walk(MethodReferenceExpr) { ref ->
-                                        try {
-                                            def resolvedRef = ref.resolve()
-                                            def declaringType = resolvedRef.declaringType().qualifiedName
-                                            def paramTypesCall = (0..<resolvedRef.numberOfParams).collect { i ->
-                                                try {
-                                                    resolvedRef.getParam(i).type.describe()
-                                                } catch (Exception e) {
-                                                    "<?>"
+                                        m.walk(MethodReferenceExpr) { ref ->
+                                            try {
+                                                def resolvedRef = ref.resolve()
+                                                def declaringType = resolvedRef.declaringType().qualifiedName
+                                                def paramTypesCall = (0..<resolvedRef.numberOfParams).collect { i ->
+                                                    try {
+                                                        resolvedRef.getParam(i).type.describe()
+                                                    } catch (Exception e) {
+                                                        "<?>"
+                                                    }
                                                 }
+                                                def calledMethod = toMethodKey(declaringType, resolvedRef.name, paramTypesCall)
+
+                                                callGraph[methodFqn] << calledMethod
+                                            } catch (Exception e) {
                                             }
-                                            def calledMethod = toMethodKey(declaringType, resolvedRef.name, paramTypesCall)
-
-//                                            println "Caller ${methodFqn}"
-//                                            println "Calleeeeeee ${calledMethod}"
-
-                                            callGraph[methodFqn] << calledMethod
-                                        } catch (Exception e) {
-                                            println "Could not resolve method reference: ${ref} — ${e.message}"
                                         }
+
                                     }
 
-                                }
+                                    cu.findAll(InitializerDeclaration).each { initializer ->
+                                        String methodFqn = "<initializer>"
 
-                                cu.findAll(InitializerDeclaration).each {initializer ->
-                                    String methodFqn = "<initializer>"
-
-                                    //allMethods << methodFqn
-
-                                    initializer.walk(MethodCallExpr) {call ->
-                                        try {
-                                            def resolved = call.resolve()
-                                            def declaringType = resolved.declaringType().qualifiedName
-                                            def paramTypesCall = (0..<resolved.numberOfParams).collect { i ->
-                                                try {
-                                                    resolved.getParam(i).type.describe()
-                                                } catch (Exception e) {
-                                                    "<?>"
+                                        initializer.walk(MethodCallExpr) { call ->
+                                            try {
+                                                def resolved = call.resolve()
+                                                def declaringType = resolved.declaringType().qualifiedName
+                                                def paramTypesCall = (0..<resolved.numberOfParams).collect { i ->
+                                                    try {
+                                                        resolved.getParam(i).type.describe()
+                                                    } catch (Exception e) {
+                                                        "<?>"
+                                                    }
                                                 }
+                                                def calledMethod = toMethodKey(declaringType, resolved.name, paramTypesCall)
+                                                callGraph[methodFqn] << calledMethod
+                                            } catch (Exception ex) {
+                                                //TO DO: add dependency injection
                                             }
-                                            def calledMethod = toMethodKey(declaringType, resolved.name, paramTypesCall)
-                                            callGraph[methodFqn] << calledMethod
-                                        }catch (Exception ex){
-                                            println ex
-                                            //TO DO: add dependency injection
                                         }
                                     }
+                                }catch(StackOverflowError e){
+                                    println e.stackTrace.take(10)
                                 }
                             }
                         }
                     }
                 }
-
-//                callGraph.each { caller, callees ->
-//                    println "$caller calls:"
-//                    callees.each { callee ->
-//                        println "  -> $callee"
-//                    }
-//                }
 
                 callGraph.values().each { callees ->
                     callees.each { callee -> entryPoints.add(callee) }
@@ -356,21 +371,6 @@ class DeadCodePlugin implements Plugin<Project> {
                         entryPoints << methodKey
                     }
                 }
-
-//                Set<String> reachable = [] as Set
-//                def queue = new LinkedList<String>(entryPoints)
-//
-//                while (!queue.isEmpty()) {
-//                    def current = queue.poll()
-//                    if (reachable.contains(current)) continue
-//
-//                    reachable << current
-//                    callGraph[current]?.each { callee ->
-//                        if (!reachable.contains(callee)) {
-//                            queue << callee
-//                        }
-//                    }
-//                }
 
                 def unusedMethods = (allMethods - entryPoints).toSorted()
                 def outputFile = new File("${project.buildDir}/potentially-unused-methods.json")
@@ -385,6 +385,7 @@ class DeadCodePlugin implements Plugin<Project> {
 
         project.task('findUsedLibraryMethods') {
             group = 'analysis'
+            dependsOn project.tasks.named("build")
 
             doLast {
                 def libPrefixesRaw = project.findProperty("libraryPackages") ?: ""
@@ -393,8 +394,6 @@ class DeadCodePlugin implements Plugin<Project> {
                     return
                 }
                 def libPrefixes = libPrefixesRaw.split(',').collect { it.trim() }
-
-                //println "Scanning for used methods from library: $libPrefix"
 
                 def findOverriddenLibraryMethod = { resolved, libPrefix ->
                     try {
@@ -483,16 +482,32 @@ class DeadCodePlugin implements Plugin<Project> {
                 ParserConfiguration config = new ParserConfiguration()
                         .setLanguageLevel(ParserConfiguration.LanguageLevel.valueOf(languageLevel))
                         .setSymbolResolver(new JavaSymbolSolver(typeSolver));
+
                 JavaParser parser = new JavaParser(config);
 
                 Set<String> usedLibraryMethods = [] as Set
-                //Set<String> unresolvedCalls = [] as Set
+
+                javaSourceDirs.each { dir ->
+                    dir.eachFileRecurse { file ->
+                        if (file.name.endsWith('.java')) {
+                            def cuOpt = parser.parse(COMPILATION_UNIT, Providers.provider(file)).getResult()
+                            if (cuOpt.isPresent()) {
+                                cuOpt.get().findAll(ClassOrInterfaceDeclaration).each {
+                                    try {
+                                        it.resolve()
+                                    } catch (Exception ignored) {}
+                                }
+                            }
+                        }
+                    }
+                }
 
                 javaSourceDirs.each { sourceDir ->
                     sourceDir.eachFileRecurse {file ->
                         if (!file.name.endsWith('.java')) return
 
-                        def cuOpt = parser.parse(file).getResult()
+                        //def cuOpt = parser.parse(file).getResult()
+                        def cuOpt = parser.parse(COMPILATION_UNIT, Providers.provider(file)).getResult()
                         if (!cuOpt.isPresent()) return
 
                         def cu = cuOpt.get()
@@ -512,7 +527,7 @@ class DeadCodePlugin implements Plugin<Project> {
                                 }
 
                                 if (libPrefixes.any { prefix -> declaringFqn.startsWith(prefix) }) {
-                                    // Tiesiogiai iš bibliotekos
+
                                     def methodKey = toMethodKey(declaringFqn, resolved.name, paramTypes)
                                     usedLibraryMethods << methodKey
                                 } else {
@@ -532,7 +547,6 @@ class DeadCodePlugin implements Plugin<Project> {
                                     }
                                 }
                             }catch(Exception e){
-                                println e
                                 if (call.scope.isPresent()) {
                                     def scopeExpr = call.scope.get()
                                     try {
@@ -552,7 +566,6 @@ class DeadCodePlugin implements Plugin<Project> {
                                             }
                                         }
                                     } catch (Exception ignored) {
-                                        println ignored
                                     }
                                 }
                             }
@@ -573,11 +586,9 @@ class DeadCodePlugin implements Plugin<Project> {
                                 }
 
                                 if (libPrefixes.any { prefix -> declaringFqn.startsWith(prefix) }) {
-                                    // Tiesiogiai iš bibliotekos
                                     def methodKey = toMethodKey(declaringFqn, resolved.name, paramTypes)
                                     usedLibraryMethods << methodKey
                                 } else {
-                                    // Tikrinam, ar override’ina bibliotekos metodą
                                     def overridden = findOverriddenLibraryMethod(resolved, libPrefixes)
                                     if (overridden != null) {
                                         def overriddenFqn = overridden.declaringType().qualifiedName
@@ -593,7 +604,6 @@ class DeadCodePlugin implements Plugin<Project> {
                                     }
                                 }
                             }catch(Exception ex){
-                                println ex
                             }
                         }
                     }
@@ -632,7 +642,7 @@ class DeadCodePlugin implements Plugin<Project> {
 
                 def jsonSlurper = new JsonSlurper()
                 def unusedJson = jsonSlurper.parse(unusedFile)
-                def unusedMethods = unusedJson.unusedMethods as Set
+                def unusedMethods = unusedJson.potentiallyUnusedMethods as Set
 
                 def usedMethods = [] as Set
                 usedDir.eachFileMatch(~/.*\.json/) { file ->
@@ -656,5 +666,19 @@ class DeadCodePlugin implements Plugin<Project> {
 
     String toMethodKey(String declaringClass, String methodName, List<String> paramTypes){
         return "${declaringClass}.${methodName}(${paramTypes.join(',')})"
+    }
+
+    boolean isInterface(String qualifiedName, CombinedTypeSolver typeSolver) {
+        try {
+            def ref = typeSolver.tryToSolveType(qualifiedName)
+            if (!ref.isSolved()) {
+                return false
+            }
+            def typeDecl = ref.getCorrespondingDeclaration()
+            return typeDecl.isInterface()
+        } catch (Exception e) {
+            println "Exception while resolving $qualifiedName: ${e.message}"
+            return false
+        }
     }
 }
